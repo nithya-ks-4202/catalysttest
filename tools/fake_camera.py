@@ -312,7 +312,15 @@ class Fleet:
         self.selector.close()
 
 
-def build_fleet(count: int, base_port: int, community: str = "public") -> list[FakeCamera]:
+def build_fleet(count: int, base_port: int, community: str = "public",
+                seed: int = 1) -> list[FakeCamera]:
+    """Build `count` simulated cameras.
+
+    Deterministic for a given seed: demo.sh writes the config in one process
+    and serves the fleet from another, and the two must agree on every port
+    and name.
+    """
+    rng = random.Random(seed)
     cameras = []
     for i in range(count):
         personality = PERSONALITIES[i % len(PERSONALITIES)]
@@ -323,7 +331,7 @@ def build_fleet(count: int, base_port: int, community: str = "public") -> list[F
                 sd_present=personality.sd_present,
                 sd_capacity_gb=personality.sd_capacity_gb,
                 start_used_fraction=min(0.97, personality.start_used_fraction
-                                        + random.uniform(-0.1, 0.15)),
+                                        + rng.uniform(-0.1, 0.15)),
                 fill_rate_per_min=personality.fill_rate_per_min,
                 read_only=personality.read_only,
                 write_errors=personality.write_errors,
@@ -377,12 +385,21 @@ def main() -> int:
                         help="fraction of requests to silently drop, 0.0-1.0")
     parser.add_argument("--write-config", type=Path, metavar="PATH",
                         help="write a matching cameras.json and exit-ready config")
+    parser.add_argument("--write-config-only", action="store_true",
+                        help="write the config and exit without binding any ports")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="RNG seed for generated personalities, so a config "
+                             "written in one run matches the fleet served by another")
     args = parser.parse_args()
 
-    cameras = build_fleet(args.count, args.base_port, args.community)
+    cameras = build_fleet(args.count, args.base_port, args.community, args.seed)
     if args.write_config:
         write_config(cameras, args.write_config, args.host, args.community)
         print(f"wrote {args.write_config}")
+    if args.write_config_only:
+        if not args.write_config:
+            parser.error("--write-config-only requires --write-config PATH")
+        return 0
 
     fleet = Fleet(cameras, args.host, args.drop_rate)
     fleet.start()
