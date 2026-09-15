@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .config import AppConfig, ConfigError, load_config
+from .config import (AppConfig, CameraConfig, ConfigError, ConfigStore,
+                     Thresholds, load_config, parse_camera)
 from .health import Severity
-from .poller import poll_fleet
+from .poller import poll_camera, poll_fleet
 from .store import Store, summarise
 
 log = logging.getLogger("camwatch")
@@ -37,13 +38,36 @@ PRUNE_INTERVAL_SECONDS = 3600
 class Monitor:
     """Owns the poll loop and the store."""
 
-    def __init__(self, config: AppConfig, store: Store) -> None:
+    def __init__(self, config: AppConfig, store: Store,
+                 config_store: ConfigStore | None = None,
+                 allow_config_edits: bool = False) -> None:
         self.config = config
         self.store = store
+        # Present only when the server was started from a real config file;
+        # without it the camera-management endpoints have nothing to write to.
+        self.config_store = config_store
+        self.allow_config_edits = allow_config_edits and config_store is not None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._poll_now = threading.Event()
         self._last_prune = time.monotonic()
+
+    def apply_config(self, config: AppConfig) -> None:
+        """Swap in a new config and poll immediately, so an added camera shows
+        up on the dashboard without waiting out the poll interval."""
+        removed = {c.id for c in self.config.cameras} - {c.id for c in config.cameras}
+        self.config = config
+        for camera_id in removed:
+            self.store.forget(camera_id)
+        self.trigger()
+
+    def reload_config(self) -> AppConfig:
+        """Re-read the config file from disk."""
+        if self.config_store is None:
+            raise ConfigError("this server was not started from a config file")
+        config = load_config(self.config_store.path)
+        self.apply_config(config)
+        return config
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="poll-loop", daemon=True)
@@ -141,12 +165,111 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
 
+    def _read_json_body(self) -> Any:
+        length = self.headers.get("Content-Length")
+        try:
+            size = int(length) if length else 0
+        except ValueError:
+            raise _BadRequest("invalid Content-Length")
+        if size <= 0:
+            return {}
+        if size > 1_000_000:
+            raise _BadRequest("request body too large")
+        raw = self.rfile.read(size)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _BadRequest(f"invalid JSON body: {exc}") from exc
+
+    def _require_config_edits(self) -> None:
+        monitor = self.monitor
+        if monitor.config_store is None:
+            raise _Forbidden("this server was not started from a config file")
+        if not monitor.allow_config_edits:
+            raise _Forbidden(
+                "camera editing is disabled because the server is not bound to "
+                "localhost. Restart with --allow-config-edits to enable it "
+                "(there is no authentication, so only do that on a trusted network)."
+            )
+
     def do_POST(self) -> None:  # noqa: N802
+        self._dispatch_write("POST")
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._dispatch_write("PATCH")
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._dispatch_write("DELETE")
+
+    def _dispatch_write(self, method: str) -> None:
         parsed = urlparse(self.path)
-        if posixpath.normpath(parsed.path) == "/api/refresh":
-            self.monitor.trigger()
+        path = posixpath.normpath(parsed.path)
+        try:
+            self._handle_write(method, path)
+        except _BadRequest as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        except _Forbidden as exc:
+            self._error(HTTPStatus.FORBIDDEN, str(exc))
+        except ConfigError as exc:
+            # A rejected edit is the user's mistake, not a server fault, and the
+            # message is written to be shown to them verbatim.
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        except BrokenPipeError:
+            pass
+        except Exception as exc:
+            log.exception("error handling %s %s", method, self.path)
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def _handle_write(self, method: str, path: str) -> None:
+        monitor = self.monitor
+
+        if method == "POST" and path == "/api/refresh":
+            monitor.trigger()
             self._send_json({"ok": True, "message": "poll requested"})
             return
+
+        # Probe a camera without saving it - the "Test connection" button.
+        if method == "POST" and path == "/api/cameras/test":
+            self._require_config_edits()
+            self._send_json(_test_camera(self._read_json_body(),
+                                         monitor.config.thresholds))
+            return
+
+        if method == "POST" and path == "/api/cameras":
+            self._require_config_edits()
+            config, entry = monitor.config_store.add_camera(self._read_json_body())
+            monitor.apply_config(config)
+            log.info("added camera %s (%s)", entry.get("id"), entry.get("host"))
+            self._send_json({"ok": True, "camera": entry}, HTTPStatus.CREATED)
+            return
+
+        if method == "POST" and path == "/api/reload":
+            self._require_config_edits()
+            config = monitor.reload_config()
+            self._send_json({"ok": True, "cameras": len(config.cameras)})
+            return
+
+        if path.startswith("/api/cameras/"):
+            camera_id = path[len("/api/cameras/"):]
+            if not camera_id or "/" in camera_id:
+                self._error(HTTPStatus.NOT_FOUND, "no such endpoint")
+                return
+            if method == "PATCH":
+                self._require_config_edits()
+                config, entry = monitor.config_store.update_camera(
+                    camera_id, self._read_json_body())
+                monitor.apply_config(config)
+                log.info("updated camera %s", camera_id)
+                self._send_json({"ok": True, "camera": entry})
+                return
+            if method == "DELETE":
+                self._require_config_edits()
+                config = monitor.config_store.remove_camera(camera_id)
+                monitor.apply_config(config)
+                log.info("removed camera %s", camera_id)
+                self._send_json({"ok": True, "removed": camera_id})
+                return
+
         self._error(HTTPStatus.NOT_FOUND, "no such endpoint")
 
     def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:
@@ -154,9 +277,11 @@ class Handler(BaseHTTPRequestHandler):
         config = self.monitor.config
 
         if path == "/api/fleet":
-            samples = store.latest()
-            order = {c.id: i for i, c in enumerate(config.cameras)}
-            samples.sort(key=lambda s: order.get(s.camera_id, 1_000_000))
+            # Only report cameras the current config still lists: the in-memory
+            # view can outlive a removed or disabled camera by a poll cycle.
+            order = {c.id: i for i, c in enumerate(config.enabled_cameras)}
+            samples = [s for s in store.latest() if s.camera_id in order]
+            samples.sort(key=lambda s: order[s.camera_id])
             hours = _int_param(query, "hours", 24, 1, 24 * 90)
             spark_points = _int_param(query, "spark", 24, 2, 200)
 
@@ -173,6 +298,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self._send_json({
                 "generated_at": time.time(),
+                "can_edit_cameras": self.monitor.allow_config_edits,
                 "poll_interval_seconds": config.poll_interval_seconds,
                 "last_poll_at": store.last_poll_at,
                 "last_poll_duration": store.last_poll_duration,
@@ -256,6 +382,103 @@ class Handler(BaseHTTPRequestHandler):
                    {"Cache-Control": "no-cache"})
 
 
+class _BadRequest(Exception):
+    """Client sent something malformed."""
+
+
+class _Forbidden(Exception):
+    """Operation is disabled in this server's configuration."""
+
+
+def _test_camera(payload: Any, thresholds: Thresholds) -> dict[str, Any]:
+    """Poll a candidate camera without saving it.
+
+    Lets the UI tell the user "found a 64 GiB card at 22%" (or exactly why not)
+    before they commit the entry to the config file.
+    """
+    if not isinstance(payload, dict):
+        raise _BadRequest("expected a camera object")
+    entry = dict(payload)
+    entry.setdefault("id", "__test__")
+    entry.setdefault("name", entry.get("host", "test"))
+    if not str(entry.get("host", "")).strip():
+        raise _BadRequest("host is required")
+
+    try:
+        camera = parse_camera(entry, 0, {})
+    except ConfigError:
+        raise
+    # Keep the probe snappy - a person is watching a spinner.
+    camera.timeout = min(camera.timeout, 2.0)
+    camera.retries = min(camera.retries, 1)
+
+    sample = poll_camera(camera, thresholds)
+    result: dict[str, Any] = {
+        "reachable": sample.reachable,
+        "error": sample.error,
+        "rtt_ms": sample.rtt_ms,
+        "sys_name": sample.sys_name,
+        "sys_descr": sample.sys_descr,
+        "sd_present": sample.sd_present,
+        "sd_label": sample.sd_label,
+        "sd_total_bytes": sample.sd_total_bytes,
+        "sd_used_bytes": sample.sd_used_bytes,
+        "sd_used_percent": sample.sd_used_percent,
+        "sd_source": sample.sd_source,
+        "severity": sample.severity,
+        "issues": sample.issues,
+    }
+
+    if not sample.reachable:
+        result["summary"] = "No SNMP response."
+        result["hint"] = ("Check that SNMP is enabled on the camera, that the "
+                          "community string matches, and that udp/"
+                          f"{camera.port} is reachable. SNMPv3 is not supported.")
+    elif not sample.sd_present:
+        result["summary"] = (f"{sample.sys_name or 'Camera'} answered, but no SD "
+                             "card was detected.")
+        result["hint"] = ("Run tools/probe.py against this host to list its "
+                          "storage volumes, then pin the right one with "
+                          "sd_storage_index or sd_patterns.")
+        # Give the UI the actual volume list so the user can choose one.
+        result["volumes"] = _list_volumes(camera)
+    else:
+        result["summary"] = (
+            f"{sample.sys_name or 'Camera'} — {sample.sd_label} at "
+            f"{sample.sd_used_percent:.1f}% of "
+            f"{_format_bytes(sample.sd_total_bytes)}")
+    return result
+
+
+def _list_volumes(camera: CameraConfig) -> list[dict[str, Any]]:
+    """Every storage row the camera reports, for the 'which one is the card?'
+    picker. Best-effort: an empty list just means we couldn't ask."""
+    from . import mibs, snmp
+    from .poller import parse_storage_rows
+
+    try:
+        with snmp.Session(camera.snmp_config()) as session:
+            rows = parse_storage_rows(session.walk(mibs.HR_STORAGE_TABLE))
+    except (snmp.SnmpError, OSError):
+        return []
+    return [
+        {
+            "index": row.index,
+            "descr": row.descr,
+            "size_bytes": row.size_bytes,
+            "used_percent": row.used_percent,
+            "is_memory": row.is_memory,
+            "is_removable": row.is_removable,
+        }
+        for row in rows
+    ]
+
+
+def _format_bytes(value: float) -> str:
+    from .health import format_bytes
+    return format_bytes(value)
+
+
 def _int_param(query: dict[str, list[str]], name: str, default: int,
                low: int, high: int) -> int:
     values = query.get(name)
@@ -279,9 +502,31 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-def serve(config: AppConfig, host: str, port: int, open_browser: bool = False) -> None:
+def is_loopback(host: str) -> bool:
+    """True when `host` only accepts connections from this machine."""
+    if host in ("localhost", ""):
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def serve(config: AppConfig, host: str, port: int, open_browser: bool = False,
+          config_path: str | Path | None = None,
+          allow_config_edits: bool | None = None) -> None:
     store = Store(config.database_path, history_days=config.history_days)
-    monitor = Monitor(config, store)
+    config_store = ConfigStore(config_path) if config_path else None
+
+    # Editing writes to disk and makes the server issue SNMP requests to any
+    # host the caller names, and there is no authentication. Safe by default on
+    # loopback; off elsewhere unless explicitly turned on.
+    if allow_config_edits is None:
+        allow_config_edits = is_loopback(host)
+
+    monitor = Monitor(config, store, config_store=config_store,
+                      allow_config_edits=allow_config_edits)
 
     handler = type("BoundHandler", (Handler,), {"monitor": monitor})
     ThreadingHTTPServer.allow_reuse_address = True
@@ -293,6 +538,11 @@ def serve(config: AppConfig, host: str, port: int, open_browser: bool = False) -
     print(f"camwatch: monitoring {len(config.enabled_cameras)} cameras "
           f"every {config.poll_interval_seconds}s")
     print(f"camwatch: dashboard at http://{shown_host}:{port}/")
+    if allow_config_edits:
+        print("camwatch: adding and editing cameras from the dashboard is enabled")
+    elif config_store is not None:
+        print("camwatch: camera editing is disabled (not bound to localhost); "
+              "pass --allow-config-edits to enable")
     if open_browser:
         threading.Thread(
             target=lambda: __import__("webbrowser").open(f"http://{shown_host}:{port}/"),
@@ -323,6 +573,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="with --once, print JSON instead of a table")
     parser.add_argument("--no-store", action="store_true",
                         help="with --once, skip writing the sample to the database")
+    edits = parser.add_mutually_exclusive_group()
+    edits.add_argument("--allow-config-edits", dest="allow_config_edits",
+                       action="store_true", default=None,
+                       help="allow adding/editing cameras from the dashboard even "
+                            "when not bound to localhost (no auth - trusted networks only)")
+    edits.add_argument("--no-config-edits", dest="allow_config_edits",
+                       action="store_false",
+                       help="disable adding/editing cameras from the dashboard")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
 
@@ -342,7 +600,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_once(config, as_json=args.json, store_results=not args.no_store)
 
     try:
-        serve(config, args.host, args.port, open_browser=args.open)
+        serve(config, args.host, args.port, open_browser=args.open,
+              config_path=args.config, allow_config_edits=args.allow_config_edits)
     except OSError as exc:
         print(f"cannot bind {args.host}:{args.port} - {exc}", file=sys.stderr)
         return 1

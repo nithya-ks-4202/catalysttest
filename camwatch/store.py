@@ -169,6 +169,15 @@ class Store:
     def latest(self) -> list[CameraSample]:
         return list(self._latest.values())
 
+    def forget(self, camera_id: str) -> None:
+        """Drop a camera from the in-memory view.
+
+        Its history rows stay in the database on purpose: removing a camera
+        from the config shouldn't destroy the record of what it was doing, and
+        re-adding the same id picks the history back up.
+        """
+        self._latest.pop(camera_id, None)
+
     def latest_for(self, camera_id: str) -> CameraSample | None:
         return self._latest.get(camera_id)
 

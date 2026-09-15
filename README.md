@@ -22,7 +22,70 @@ full, card missing, card read-only, offline, recently rebooted), backfills some
 history so the charts have something to draw, and serves the dashboard at
 http://127.0.0.1:8080/. No real hardware involved.
 
-## Point it at real cameras
+## Add your real cameras
+
+### The easy way — from the dashboard
+
+Click **Add camera**, type the IP, and press **Test connection**. It polls the
+camera there and then and tells you what it found:
+
+- *Camera found — /mnt/sdcard (SD Card) at 44.4% of 128.0 GiB* → press Add.
+- *Answered, but no SD card was detected* → a dropdown appears listing the
+  camera's actual volumes, so you can pick the right one.
+- *No SNMP response* → it tells you what to check.
+
+Saving writes to `cameras.json` and polls the new camera immediately, so it
+appears on the dashboard within a second. Each card gets edit (✎) and remove
+(🗑) buttons too.
+
+Editing is enabled automatically when the server is bound to localhost (the
+default). It's **off** when bound to anything else, because these endpoints
+write to disk and there is no authentication — pass `--allow-config-edits` to
+override that on a network you trust.
+
+### Or work out the settings first
+
+`tools/probe.py` answers "will this work with my camera, and which volume is
+the SD card?":
+
+```bash
+python3 tools/probe.py 192.168.1.41                 # probe one camera
+python3 tools/probe.py --scan 192.168.1.0/24        # find SNMP devices first
+```
+
+It tries `public` then `private`, and v2c then v1, unless you pin them with
+`--community` / `--version`. Output:
+
+```
+✓ 192.168.1.41:161 answered SNMP v2c in 4 ms
+
+  sysName   Lobby North
+  sysDescr  Catalyst C500 Dome Camera; firmware 4.2.1; Linux 5.10
+
+HOST-RESOURCES-MIB storage table
+     IDX  DESCRIPTION                              SIZE   USED  TYPE
+  ------------------------------------------------------------------------
+       1  Physical memory                     512.0 MiB    61%  RAM
+       2  / (root filesystem)                 256.0 MiB    77%  fixed disk
+  →    3  /mnt/sdcard (SD Card)                64.0 GiB    22%  removable disk
+
+✓ SD card detected via hrStorage
+    14.1 GiB used of 64.0 GiB (22.0%)
+
+Config entry — paste into the "cameras" list in cameras.json:
+
+    {
+      "id": "cam-lobby-north",
+      "name": "Lobby North",
+      "host": "192.168.1.41"
+    }
+```
+
+The `→` marks the row camwatch picked. If it picked wrong, the table gives you
+the index to pin with `sd_storage_index`. Exit status is 0 when a card was
+found, so it also works as a check in a script.
+
+### Or edit the file by hand
 
 ```bash
 cp cameras.example.json cameras.json
@@ -139,6 +202,20 @@ into whatever you already run.
 | `GET /api/events?limit=50` | Recent severity transitions |
 | `GET /api/health` | Liveness — `503` if the poll loop has stalled |
 | `POST /api/refresh` | Ask the poller to sweep now |
+| `POST /api/cameras/test` | Probe a camera without saving it |
+| `POST /api/cameras` | Add a camera |
+| `PATCH /api/cameras/<id>` | Update a camera (send `null` to clear a field) |
+| `DELETE /api/cameras/<id>` | Remove a camera (its history is kept) |
+| `POST /api/reload` | Re-read `cameras.json` from disk |
+
+The last five write to `cameras.json` and are gated — see the note above. They
+return `403` when editing is disabled and `400` with a human-readable `error`
+when the submitted entry is invalid.
+
+Edits go through the raw JSON, never a parsed config, so a `${VAR}` community
+string stays a placeholder in the file rather than being written out expanded.
+Writes are atomic and validated by re-parsing first, so a rejected edit leaves
+the file byte-for-byte untouched.
 
 `/api/health` is designed to be pointed at by an uptime checker: it fails when
 polling stops, which is the failure mode a camera dashboard is worst at
@@ -158,6 +235,7 @@ camwatch/
   server.py    poll loop, JSON API, static file serving
 web/           the dashboard (no framework, no build step)
 tools/
+  probe.py         probe/scan for cameras and show how to configure them
   fake_camera.py   an SNMP agent that impersonates a fleet of cameras
   seed_history.py  backfill plausible history for a demo
 ```
@@ -172,10 +250,11 @@ one hung camera never delays a dashboard request.
 python3 -m unittest discover -s tests
 ```
 
-117 tests, no network access beyond loopback. The integration tests run the
+168 tests, no network access beyond loopback. The integration tests run the
 real client against the simulator over real UDP sockets, including a
 packet-loss test that checks retries ride out a lossy link instead of reporting
-a false outage.
+a false outage, and a test that a `${VAR}` community string is never written
+back to disk expanded.
 
 ## Limitations
 
@@ -188,6 +267,8 @@ a false outage.
   tool. Keep polling on a management VLAN and use a read-only community.
 - The dashboard has **no authentication**. It binds to `127.0.0.1` by default;
   if you use `--host 0.0.0.0`, put it behind something that does authenticate.
+  Camera editing is disabled automatically in that case (`--allow-config-edits`
+  overrides it) — but that gate is a guard rail, not a security boundary.
 - Write-error counts come from `hrStorageAllocationFailures` or a vendor OID.
   Plenty of cameras report neither, in which case that column stays at zero —
   absence of errors here is not evidence the card is healthy.

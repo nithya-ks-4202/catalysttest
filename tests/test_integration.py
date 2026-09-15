@@ -587,5 +587,296 @@ class TestHttpApi(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 404)
 
 
+class TestCameraManagementApi(unittest.TestCase):
+    """Add/edit/remove cameras over HTTP, against a real config file."""
+
+    port = BASE_PORT + 100
+    http_port = BASE_PORT + 120
+
+    @classmethod
+    def setUpClass(cls):
+        cls.harness = SimulatorHarness(
+            [Personality("Managed Cam", start_used_fraction=0.4, fill_rate_per_min=0),
+             Personality("Spare Cam", start_used_fraction=0.5, fill_rate_per_min=0),
+             Personality("No Card Cam", sd_present=False)], cls.port)
+        cls.harness.__enter__()
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.config_path = Path(cls.tmp.name) / "cameras.json"
+        cls.db_path = Path(cls.tmp.name) / "manage.db"
+        cls.config_path.write_text(json.dumps({
+            "poll_interval_seconds": 3600,  # long: tests trigger polls explicitly
+            "database_path": str(cls.db_path),
+            "cameras": [{"id": "cam-01", "name": "Managed Cam",
+                         "host": "127.0.0.1", "port": cls.port,
+                         "community": "public", "timeout": 1.0}],
+        }, indent=2))
+
+        from camwatch.config import ConfigStore, load_config
+        from camwatch.server import Handler, Monitor
+        from http.server import ThreadingHTTPServer
+
+        config = load_config(cls.config_path)
+        cls.store = Store(str(cls.db_path))
+        cls.monitor = Monitor(config, cls.store,
+                              config_store=ConfigStore(cls.config_path),
+                              allow_config_edits=True)
+        cls.monitor.poll_once()
+
+        handler = type("BoundHandler", (Handler,), {"monitor": cls.monitor})
+        ThreadingHTTPServer.allow_reuse_address = True
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", cls.http_port), handler)
+        cls.httpd.daemon_threads = True
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.store.close()
+        cls.tmp.cleanup()
+        cls.harness.__exit__(None, None, None)
+
+    def tearDown(self):
+        # Reset the config between tests so each starts from one camera.
+        self.config_path.write_text(json.dumps({
+            "poll_interval_seconds": 3600,
+            "database_path": str(self.db_path),
+            "cameras": [{"id": "cam-01", "name": "Managed Cam",
+                         "host": "127.0.0.1", "port": self.port,
+                         "community": "public", "timeout": 1.0}],
+        }, indent=2))
+        self.monitor.reload_config()
+
+    def request(self, method, path, payload=None):
+        url = f"http://127.0.0.1:{self.http_port}{path}"
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            body = response.read()
+            return response.status, (json.loads(body) if body else {})
+
+    def cameras_in_file(self):
+        return json.loads(self.config_path.read_text())["cameras"]
+
+    # -- test endpoint -----------------------------------------------------
+
+    def test_test_endpoint_finds_a_card(self):
+        status, payload = self.request("POST", "/api/cameras/test", {
+            "host": "127.0.0.1", "port": self.port + 1, "community": "public"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["reachable"])
+        self.assertTrue(payload["sd_present"])
+        self.assertIn("Spare Cam", payload["summary"])
+
+    def test_test_endpoint_reports_unreachable(self):
+        status, payload = self.request("POST", "/api/cameras/test", {
+            "host": "127.0.0.1", "port": self.port + 900, "timeout": 0.4})
+        self.assertEqual(status, 200)  # the probe ran; the camera just didn't answer
+        self.assertFalse(payload["reachable"])
+        self.assertIn("hint", payload)
+
+    def test_test_endpoint_lists_volumes_when_no_card_found(self):
+        """The UI needs the volume list to offer a 'which one is it?' picker."""
+        status, payload = self.request("POST", "/api/cameras/test", {
+            "host": "127.0.0.1", "port": self.port + 2, "community": "public"})
+        self.assertTrue(payload["reachable"])
+        self.assertFalse(payload["sd_present"])
+        self.assertTrue(payload["volumes"])
+        self.assertTrue(any("root" in v["descr"] for v in payload["volumes"]))
+
+    def test_test_endpoint_requires_host(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request("POST", "/api/cameras/test", {"name": "no host"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_test_endpoint_does_not_save(self):
+        self.request("POST", "/api/cameras/test",
+                     {"host": "127.0.0.1", "port": self.port + 1})
+        self.assertEqual(len(self.cameras_in_file()), 1)
+
+    # -- create ------------------------------------------------------------
+
+    def test_add_camera(self):
+        status, payload = self.request("POST", "/api/cameras", {
+            "name": "Spare Cam", "host": "127.0.0.1", "port": self.port + 1})
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["camera"]["id"], "cam-spare-cam")
+        self.assertEqual(len(self.cameras_in_file()), 2)
+
+    def test_added_camera_is_polled_and_appears_in_fleet(self):
+        self.request("POST", "/api/cameras", {
+            "name": "Spare Cam", "host": "127.0.0.1", "port": self.port + 1})
+        self.monitor.poll_once()
+        _, fleet = self.request("GET", "/api/fleet")
+        names = [c["name"] for c in fleet["cameras"]]
+        self.assertIn("Spare Cam", names)
+
+    def test_add_rejects_bad_input(self):
+        for payload in ({"name": "no host"}, {"host": "1.2.3.4", "port": 99999},
+                        {"host": "1.2.3.4", "version": "v3"},
+                        {"host": "1.2.3.4", "nope": 1}):
+            with self.assertRaises(urllib.error.HTTPError,
+                                   msg=f"{payload} should be rejected") as ctx:
+                self.request("POST", "/api/cameras", payload)
+            self.assertEqual(ctx.exception.code, 400)
+        self.assertEqual(len(self.cameras_in_file()), 1)
+
+    def test_add_rejects_malformed_json(self):
+        url = f"http://127.0.0.1:{self.http_port}/api/cameras"
+        req = urllib.request.Request(url, data=b"{not json", method="POST")
+        req.add_header("Content-Type", "application/json")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 400)
+
+    # -- update ------------------------------------------------------------
+
+    def test_patch_camera(self):
+        status, payload = self.request("PATCH", "/api/cameras/cam-01",
+                                       {"name": "Renamed", "site": "HQ"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["camera"]["name"], "Renamed")
+        entry = self.cameras_in_file()[0]
+        self.assertEqual(entry["name"], "Renamed")
+        self.assertEqual(entry["host"], "127.0.0.1")  # untouched
+
+    def test_patch_unknown_camera_400s(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request("PATCH", "/api/cameras/nope", {"name": "X"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    # -- delete ------------------------------------------------------------
+
+    def test_delete_camera(self):
+        self.request("POST", "/api/cameras", {
+            "name": "Spare Cam", "host": "127.0.0.1", "port": self.port + 1})
+        status, payload = self.request("DELETE", "/api/cameras/cam-spare-cam")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["removed"], "cam-spare-cam")
+        self.assertEqual(len(self.cameras_in_file()), 1)
+
+    def test_deleted_camera_disappears_from_fleet(self):
+        """A removed camera must not linger in the in-memory view."""
+        self.request("POST", "/api/cameras", {
+            "name": "Spare Cam", "host": "127.0.0.1", "port": self.port + 1})
+        self.monitor.poll_once()
+        self.request("DELETE", "/api/cameras/cam-spare-cam")
+        _, fleet = self.request("GET", "/api/fleet")
+        self.assertNotIn("Spare Cam", [c["name"] for c in fleet["cameras"]])
+        self.assertEqual(fleet["summary"]["cameras_total"], 1)
+
+    def test_cannot_delete_the_last_camera(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request("DELETE", "/api/cameras/cam-01")
+        self.assertEqual(ctx.exception.code, 400)
+        self.assertEqual(len(self.cameras_in_file()), 1)
+
+    # -- capability flag ---------------------------------------------------
+
+    def test_fleet_reports_edit_capability(self):
+        _, fleet = self.request("GET", "/api/fleet")
+        self.assertTrue(fleet["can_edit_cameras"])
+
+
+class TestCameraManagementDisabled(unittest.TestCase):
+    """With editing off, every mutating endpoint must refuse."""
+
+    port = BASE_PORT + 140
+    http_port = BASE_PORT + 160
+
+    @classmethod
+    def setUpClass(cls):
+        cls.harness = SimulatorHarness([Personality("Locked Cam")], cls.port)
+        cls.harness.__enter__()
+        cls.tmp = tempfile.TemporaryDirectory()
+        config_path = Path(cls.tmp.name) / "cameras.json"
+        config_path.write_text(json.dumps({
+            "poll_interval_seconds": 3600,
+            "database_path": str(Path(cls.tmp.name) / "locked.db"),
+            "cameras": [{"id": "cam-01", "host": "127.0.0.1", "port": cls.port,
+                         "timeout": 1.0}],
+        }))
+
+        from camwatch.config import ConfigStore, load_config
+        from camwatch.server import Handler, Monitor
+        from http.server import ThreadingHTTPServer
+
+        cls.config_path = config_path
+        cls.store = Store(str(Path(cls.tmp.name) / "locked.db"))
+        cls.monitor = Monitor(load_config(config_path), cls.store,
+                              config_store=ConfigStore(config_path),
+                              allow_config_edits=False)
+        cls.monitor.poll_once()
+        handler = type("BoundHandler", (Handler,), {"monitor": cls.monitor})
+        ThreadingHTTPServer.allow_reuse_address = True
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", cls.http_port), handler)
+        cls.httpd.daemon_threads = True
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.store.close()
+        cls.tmp.cleanup()
+        cls.harness.__exit__(None, None, None)
+
+    def request(self, method, path, payload=None):
+        url = f"http://127.0.0.1:{self.http_port}{path}"
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return response.status, json.loads(response.read() or b"{}")
+
+    def test_all_mutations_are_forbidden(self):
+        attempts = [
+            ("POST", "/api/cameras", {"host": "1.2.3.4"}),
+            ("POST", "/api/cameras/test", {"host": "1.2.3.4"}),
+            ("PATCH", "/api/cameras/cam-01", {"name": "X"}),
+            ("DELETE", "/api/cameras/cam-01", None),
+            ("POST", "/api/reload", None),
+        ]
+        for method, path, payload in attempts:
+            with self.assertRaises(urllib.error.HTTPError,
+                                   msg=f"{method} {path} should be forbidden") as ctx:
+                self.request(method, path, payload)
+            self.assertEqual(ctx.exception.code, 403)
+
+    def test_config_file_is_untouched(self):
+        before = self.config_path.read_text()
+        try:
+            self.request("POST", "/api/cameras", {"host": "1.2.3.4"})
+        except urllib.error.HTTPError:
+            pass
+        self.assertEqual(self.config_path.read_text(), before)
+
+    def test_read_endpoints_still_work(self):
+        status, fleet = self.request("GET", "/api/fleet")
+        self.assertEqual(status, 200)
+        self.assertFalse(fleet["can_edit_cameras"])
+
+    def test_refresh_is_still_allowed(self):
+        """Refresh only re-polls existing cameras, so it isn't gated."""
+        status, _ = self.request("POST", "/api/refresh", None)
+        self.assertEqual(status, 200)
+
+
+class TestLoopbackDetection(unittest.TestCase):
+    def test_loopback_hosts(self):
+        from camwatch.server import is_loopback
+        for host in ("127.0.0.1", "localhost", "", "::1", "127.0.1.1"):
+            self.assertTrue(is_loopback(host), f"{host!r} should be loopback")
+
+    def test_non_loopback_hosts(self):
+        from camwatch.server import is_loopback
+        for host in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "::", "example.com"):
+            self.assertFalse(is_loopback(host), f"{host!r} should not be loopback")
+
+
 if __name__ == "__main__":
     unittest.main()

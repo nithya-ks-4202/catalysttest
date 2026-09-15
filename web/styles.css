@@ -370,6 +370,115 @@ main { max-width: 1400px; margin: 0 auto; padding: 0 24px; }
   border-radius: var(--radius);
 }
 
+/* --- camera add/edit dialog ------------------------------------------- */
+
+.btn-primary {
+  background: var(--text-primary); color: var(--surface-1);
+  border-color: var(--text-primary); font-weight: 500;
+}
+.btn-primary:hover { background: var(--text-primary); opacity: 0.85; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.camera-dialog {
+  width: min(720px, calc(100vw - 32px));
+  padding: 0; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface-1); color: var(--text-primary);
+  box-shadow: 0 12px 40px rgba(11, 11, 11, 0.24);
+}
+.camera-dialog::backdrop { background: rgba(11, 11, 11, 0.45); }
+
+.dialog-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--border);
+}
+.dialog-head h2 { font-size: 15px; }
+
+.dialog-body {
+  padding: 18px; display: grid; gap: 14px;
+  max-height: min(60vh, 560px); overflow-y: auto;
+}
+
+.dialog-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 14px 18px; border-top: 1px solid var(--border);
+  background: var(--page); border-radius: 0 0 var(--radius) var(--radius);
+}
+.dialog-foot-right { display: flex; gap: 8px; }
+
+.field-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.field { display: grid; gap: 4px; }
+.field-grow { flex: 1 1 200px; min-width: 0; }
+.field-port { flex: 0 0 96px; }
+.field-version { flex: 0 0 150px; }
+.field label { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.req { color: var(--status-critical); }
+.field input, .field select {
+  width: 100%; min-height: 34px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-1); color: var(--text-primary);
+  font: inherit; font-size: 13px;
+}
+.field input:focus-visible, .field select:focus-visible {
+  outline: 2px solid var(--series-1); outline-offset: -1px;
+}
+.field-hint { font-size: 11px; color: var(--text-muted); line-height: 1.45; }
+.field-hint code {
+  font-size: 11px; padding: 1px 4px; border-radius: 3px;
+  background: var(--hover-wash);
+}
+
+.advanced {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.advanced summary {
+  cursor: pointer; font-size: 12px; font-weight: 500;
+  color: var(--text-secondary);
+}
+.advanced[open] summary { margin-bottom: 10px; }
+.advanced .field-row, .advanced .field { margin-top: 10px; }
+.advanced-intro { margin-top: 0; }
+
+/* Test result: status colour plus an icon and a label, never colour alone. */
+.test-result {
+  display: flex; gap: 9px; align-items: flex-start;
+  padding: 11px 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); font-size: 13px;
+}
+.test-result .status-icon { margin-top: 1px; flex: none; }
+.test-result-body { display: grid; gap: 3px; min-width: 0; }
+.test-result-title { font-weight: 600; }
+.test-result-detail { color: var(--text-secondary); font-size: 12px; }
+.test-result.is-good { background: var(--track-good); }
+.test-result.is-warning { background: var(--track-warning); }
+.test-result.is-critical { background: var(--track-critical); }
+.test-result.is-pending { background: var(--hover-wash); }
+
+.form-error {
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--track-critical); font-size: 13px;
+}
+
+/* --- per-card actions ------------------------------------------------- */
+
+.camera-actions { display: flex; gap: 4px; margin-left: auto; }
+.icon-btn {
+  width: 26px; height: 26px; padding: 0; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid transparent; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-muted);
+  font: inherit; font-size: 13px; cursor: pointer; line-height: 1;
+}
+.icon-btn:hover { background: var(--hover-wash); color: var(--text-primary); }
+.icon-btn:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  z-index: 60; padding: 10px 16px; border-radius: var(--radius-sm);
+  background: var(--text-primary); color: var(--surface-1);
+  font-size: 13px; box-shadow: 0 6px 20px rgba(11, 11, 11, 0.24);
+}
+
 /* --- tooltip ---------------------------------------------------------- */
 
 .tooltip {

@@ -199,6 +199,7 @@ async function requestRefresh() {
 function render() {
   const data = state.data;
   if (!data) return;
+  $('add-camera').hidden = !data.can_edit_cameras;
   renderStatusLine(data);
   renderOverview(data);
   renderStatusBar(data);
@@ -385,6 +386,24 @@ function buildCameraCard(camera, thresholds) {
   pill.append(dot, el('span', null, meta.label));
   pill.style.background = meta.track;
   head.appendChild(pill);
+
+  if (state.data?.can_edit_cameras) {
+    const actions = el('div', 'camera-actions');
+    const edit = el('button', 'icon-btn', '✎');
+    edit.type = 'button';
+    edit.title = `Edit ${camera.name}`;
+    edit.setAttribute('aria-label', `Edit ${camera.name}`);
+    edit.addEventListener('click', () => openCameraDialog(camera));
+
+    const remove = el('button', 'icon-btn', '🗑');
+    remove.type = 'button';
+    remove.title = `Remove ${camera.name}`;
+    remove.setAttribute('aria-label', `Remove ${camera.name}`);
+    remove.addEventListener('click', () => removeCamera(camera));
+
+    actions.append(edit, remove);
+    head.appendChild(actions);
+  }
   card.appendChild(head);
 
   // --- capacity meter -----------------------------------------------------
@@ -733,6 +752,254 @@ function formatAxisTime(timestamp) {
 }
 
 // ---------------------------------------------------------------------------
+// Add / edit camera
+// ---------------------------------------------------------------------------
+
+const dialog = {
+  editingId: null,      // null = adding, otherwise the camera id being edited
+  lastVolumes: [],
+};
+
+function openCameraDialog(camera) {
+  const node = $('camera-dialog');
+  const form = $('camera-form');
+  form.reset();
+  dialog.editingId = camera ? camera.camera_id : null;
+  dialog.lastVolumes = [];
+
+  $('dialog-title').textContent = camera ? `Edit ${camera.name}` : 'Add a camera';
+  $('dialog-save').textContent = camera ? 'Save changes' : 'Add camera';
+  $('test-result').hidden = true;
+  $('form-error').hidden = true;
+  $('volume-picker-field').hidden = true;
+  $('advanced').open = false;
+
+  if (camera) {
+    // The fleet payload carries "host:port" as one string; split it back out.
+    const [host, port] = splitHostPort(camera.host);
+    $('f-host').value = host;
+    $('f-port').value = port && port !== '161' ? port : '';
+    $('f-name').value = camera.name || '';
+    $('f-site').value = camera.site || '';
+  }
+
+  node.showModal();
+  $('f-host').focus();
+}
+
+function splitHostPort(text) {
+  const value = String(text || '');
+  const idx = value.lastIndexOf(':');
+  // Guard against bare IPv6 without brackets - only split on a numeric tail.
+  if (idx > 0 && /^\d+$/.test(value.slice(idx + 1))) {
+    return [value.slice(0, idx), value.slice(idx + 1)];
+  }
+  return [value, ''];
+}
+
+/* Collect the form into the JSON body the API expects. Blank fields are
+   omitted when adding (so defaults apply) and sent as null when editing (so
+   clearing a field actually clears it). */
+function collectCameraForm() {
+  const editing = dialog.editingId !== null;
+  const body = {};
+  const put = (key, value) => {
+    if (value === '' || value === undefined) {
+      if (editing) body[key] = null;
+    } else {
+      body[key] = value;
+    }
+  };
+
+  const host = $('f-host').value.trim();
+  if (!host) throw new Error('An address is required.');
+  body.host = host;
+
+  const port = $('f-port').value.trim();
+  put('port', port ? Number(port) : '');
+  put('name', $('f-name').value.trim());
+  put('site', $('f-site').value.trim());
+  put('community', $('f-community').value.trim());
+  put('version', $('f-version').value);
+
+  const index = $('f-storage-index').value;
+  put('sd_storage_index', index ? Number(index) : '');
+
+  const patterns = $('f-patterns').value.trim();
+  put('sd_patterns', patterns
+    ? patterns.split(',').map((p) => p.trim().toLowerCase()).filter(Boolean)
+    : '');
+
+  put('sd_size_oid', $('f-size-oid').value.trim());
+  put('sd_used_oid', $('f-used-oid').value.trim());
+  return body;
+}
+
+function showTestResult(kind, title, detail) {
+  const node = $('test-result');
+  node.className = `test-result is-${kind}`;
+  node.hidden = false;
+  const meta = severityOf(kind === 'pending' ? 'unknown' : kind);
+  node.replaceChildren();
+  const icon = el('span', 'status-icon', kind === 'pending' ? '…' : meta.icon);
+  icon.style.color = meta.color;
+  icon.setAttribute('aria-hidden', 'true');
+  const body = el('div', 'test-result-body');
+  body.appendChild(el('div', 'test-result-title', title));
+  if (detail) body.appendChild(el('div', 'test-result-detail', detail));
+  node.append(icon, body);
+  node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+/* Offer the camera's actual volume list when no card was auto-detected, so the
+   fix is a dropdown rather than a trip to the docs. */
+function populateVolumePicker(volumes) {
+  dialog.lastVolumes = volumes || [];
+  const select = $('f-storage-index');
+  const current = select.value;
+  select.replaceChildren();
+  select.appendChild(new Option('Detect automatically', ''));
+  for (const volume of dialog.lastVolumes) {
+    const size = volume.size_bytes ? formatBytes(volume.size_bytes) : 'unknown size';
+    const used = volume.used_percent !== null && volume.used_percent !== undefined
+      ? `, ${volume.used_percent.toFixed(0)}% used` : '';
+    const note = volume.is_memory ? ' — memory, not a card' : '';
+    select.appendChild(new Option(
+      `${volume.index}: ${volume.descr} (${size}${used})${note}`, String(volume.index)));
+  }
+  select.value = current;
+  $('volume-picker-field').hidden = dialog.lastVolumes.length === 0;
+  if (dialog.lastVolumes.length) $('advanced').open = true;
+}
+
+async function testConnection() {
+  const button = $('test-connection');
+  $('form-error').hidden = true;
+  let body;
+  try {
+    body = collectCameraForm();
+  } catch (error) {
+    showFormError(error.message);
+    return;
+  }
+
+  button.disabled = true;
+  showTestResult('pending', 'Testing…', `Contacting ${body.host} over SNMP`);
+  try {
+    const response = await fetch('/api/cameras/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(stripNulls(body)),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      showTestResult('critical', 'Could not test', result.error || `HTTP ${response.status}`);
+      return;
+    }
+    if (!result.reachable) {
+      showTestResult('critical', result.summary || 'No SNMP response', result.hint);
+    } else if (!result.sd_present) {
+      showTestResult('warning', result.summary || 'No SD card detected', result.hint);
+      populateVolumePicker(result.volumes);
+    } else {
+      showTestResult('good', 'Camera found', result.summary);
+      $('volume-picker-field').hidden = true;
+      // Offer the discovered name when the user hasn't typed one.
+      if (!$('f-name').value.trim() && result.sys_name) {
+        $('f-name').value = result.sys_name;
+      }
+    }
+  } catch (error) {
+    showTestResult('critical', 'Could not test', error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function stripNulls(body) {
+  return Object.fromEntries(
+    Object.entries(body).filter(([, value]) => value !== null));
+}
+
+function showFormError(message) {
+  const node = $('form-error');
+  node.textContent = message;
+  node.hidden = false;
+}
+
+async function saveCamera(event) {
+  event.preventDefault();
+  $('form-error').hidden = true;
+
+  let body;
+  try {
+    body = collectCameraForm();
+  } catch (error) {
+    showFormError(error.message);
+    return;
+  }
+
+  const editing = dialog.editingId !== null;
+  const button = $('dialog-save');
+  button.disabled = true;
+  try {
+    const response = await fetch(
+      editing ? `/api/cameras/${encodeURIComponent(dialog.editingId)}` : '/api/cameras',
+      {
+        method: editing ? 'PATCH' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editing ? body : stripNulls(body)),
+      });
+    const result = await response.json();
+    if (!response.ok) {
+      showFormError(result.error || `HTTP ${response.status}`);
+      return;
+    }
+    $('camera-dialog').close();
+    toast(editing ? 'Camera updated' : 'Camera added');
+    // The server polls the new camera immediately; give it a beat to land.
+    setTimeout(() => load({ quiet: true }), 700);
+  } catch (error) {
+    showFormError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function removeCamera(camera) {
+  const confirmed = window.confirm(
+    `Remove ${camera.name} from monitoring?\n\n` +
+    'Its recorded history is kept, so re-adding it later picks up where it left off.');
+  if (!confirmed) return;
+  try {
+    const response = await fetch(
+      `/api/cameras/${encodeURIComponent(camera.camera_id)}`, { method: 'DELETE' });
+    const result = await response.json();
+    if (!response.ok) {
+      toast(result.error || `Could not remove (HTTP ${response.status})`);
+      return;
+    }
+    toast('Camera removed');
+    setTimeout(() => load({ quiet: true }), 400);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+let toastTimer = null;
+function toast(message) {
+  let node = document.querySelector('.toast');
+  if (!node) {
+    node = el('div', 'toast');
+    node.setAttribute('role', 'status');
+    document.body.appendChild(node);
+  }
+  node.textContent = message;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.remove(), 3200);
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -764,6 +1031,16 @@ function init() {
   });
 
   $('refresh').addEventListener('click', requestRefresh);
+  $('add-camera').addEventListener('click', () => openCameraDialog(null));
+  $('camera-form').addEventListener('submit', saveCamera);
+  $('test-connection').addEventListener('click', testConnection);
+  for (const id of ['dialog-close', 'dialog-cancel']) {
+    $(id).addEventListener('click', () => $('camera-dialog').close());
+  }
+  // Clicking the backdrop closes the dialog, matching the usual expectation.
+  $('camera-dialog').addEventListener('click', (event) => {
+    if (event.target === $('camera-dialog')) $('camera-dialog').close();
+  });
 
   let searchTimer = null;
   $('search').addEventListener('input', (event) => {
