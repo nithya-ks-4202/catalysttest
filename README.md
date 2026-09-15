@@ -22,6 +22,15 @@ full, card missing, card read-only, offline, recently rebooted), backfills some
 history so the charts have something to draw, and serves the dashboard at
 http://127.0.0.1:8080/. No real hardware involved.
 
+If you get `permission denied`, run `chmod +x demo.sh` first. On Windows, use
+`bash demo.sh` under WSL or Git Bash.
+
+The demo looks after its own ports. If `udp/11610-11617` or `tcp/8080` are busy
+— usually a simulator left behind by a run that was killed before it could tidy
+up — it stops a leftover it recognises, otherwise steps up to the next free
+range, and tells you which ports it settled on. Override the starting points
+with `BASE_PORT=21610 PORT=9000 ./demo.sh`.
+
 ## Add your real cameras
 
 ### The easy way — from the dashboard
@@ -250,7 +259,7 @@ one hung camera never delays a dashboard request.
 python3 -m unittest discover -s tests
 ```
 
-168 tests, no network access beyond loopback. The integration tests run the
+173 tests, no network access beyond loopback. The integration tests run the
 real client against the simulator over real UDP sockets, including a
 packet-loss test that checks retries ride out a lossy link instead of reporting
 a false outage, and a test that a `${VAR}` community string is never written

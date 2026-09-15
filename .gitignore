@@ -6,6 +6,7 @@
 # Local config - it holds community strings; cameras.example.json is the template
 cameras.json
 demo-cameras.json
+.demo-simulator.pid
 
 # Python
 __pycache__/

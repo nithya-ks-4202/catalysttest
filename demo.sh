@@ -15,6 +15,7 @@ BASE_PORT="${BASE_PORT:-11610}"
 COUNT="${COUNT:-8}"
 CONFIG="demo-cameras.json"
 DB="demo.db"
+PIDFILE=".demo-simulator.pid"
 
 cleanup() {
   echo
@@ -23,8 +24,34 @@ cleanup() {
     kill "$SIM_PID" 2>/dev/null || true
     wait "$SIM_PID" 2>/dev/null || true
   fi
+  rm -f "$PIDFILE"
 }
 trap cleanup EXIT INT TERM
+
+# If a previous run was killed before its trap fired, its simulator is still
+# holding UDP ports. Clean that up rather than leaking one process per run.
+if [[ -f "$PIDFILE" ]]; then
+  STALE="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [[ -n "$STALE" ]] && kill -0 "$STALE" 2>/dev/null; then
+    # Only kill it if it really is our simulator, never an unrelated PID.
+    if ps -p "$STALE" -o command= 2>/dev/null | grep -q "fake_camera.py"; then
+      echo "→ stopping a simulator left over from a previous run (pid $STALE)"
+      kill "$STALE" 2>/dev/null || true
+      # Wait for it to actually exit, so its ports are free again and this run
+      # can use the default range rather than stepping past it.
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$STALE" 2>/dev/null || break
+        sleep 0.2
+      done
+    fi
+  fi
+  rm -f "$PIDFILE"
+fi
+
+# Start from a clean demo database every run. It is throwaway data that gets
+# re-seeded below, and reusing it both piles up duplicate synthetic history and
+# inherits any broken WAL state left by a run that was killed outright.
+rm -f "$DB" "$DB-wal" "$DB-shm"
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
   echo "error: '$PYTHON' not found. Install Python 3.9+, or set PYTHON=/path/to/python3" >&2
@@ -39,9 +66,19 @@ PY
 # Write the config synchronously first. Doing this inside the backgrounded
 # simulator would race: the next step reads the file, and on a cold start the
 # simulator may not have written it yet.
-echo "→ writing $CONFIG"
-"$PYTHON" tools/fake_camera.py --count "$COUNT" --base-port "$BASE_PORT" \
-  --write-config "$CONFIG" --write-config-only >/dev/null
+#
+# --auto-port steps past a busy range (a stale simulator from a previous run is
+# the usual cause) and reports the range it settled on, so the config we just
+# wrote and the fleet we serve always agree.
+CHOSEN_PORT="$("$PYTHON" tools/fake_camera.py --count "$COUNT" \
+  --base-port "$BASE_PORT" --auto-port --print-base-port \
+  --write-config "$CONFIG" --write-config-only)"
+
+if [[ "$CHOSEN_PORT" != "$BASE_PORT" ]]; then
+  echo "→ udp/${BASE_PORT} was busy — using udp/${CHOSEN_PORT} instead"
+fi
+BASE_PORT="$CHOSEN_PORT"
+echo "→ wrote $CONFIG"
 
 # Point it at a demo database and a brisk poll interval.
 "$PYTHON" - "$CONFIG" "$DB" <<'PY'
@@ -58,6 +95,7 @@ PY
 echo "→ starting $COUNT simulated cameras on udp/${BASE_PORT}-$((BASE_PORT + COUNT - 1))"
 "$PYTHON" tools/fake_camera.py --count "$COUNT" --base-port "$BASE_PORT" >/dev/null &
 SIM_PID=$!
+echo "$SIM_PID" > "$PIDFILE"
 
 # Wait until a camera actually answers, rather than guessing with a sleep.
 echo "→ waiting for the simulated fleet to come up"
@@ -96,7 +134,30 @@ echo "→ priming the database with one poll"
 echo "→ backfilling 48h of history so the trend chart has something to show"
 "$PYTHON" tools/seed_history.py --db "$DB" --hours 48 --interval 300 >/dev/null
 
+# Same treatment for the dashboard's TCP port, so a leftover server (or any
+# other app on 8080) doesn't stop the demo either.
+WEB_PORT="$("$PYTHON" - "$PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+for candidate in range(port, port + 40):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", candidate))
+        print(candidate)
+        break
+    except OSError:
+        continue
+    finally:
+        sock.close()
+else:
+    sys.exit(f"no free TCP port between {port} and {port + 39}")
+PY
+)"
+if [[ "$WEB_PORT" != "$PORT" ]]; then
+  echo "→ tcp/${PORT} was busy — serving on ${WEB_PORT} instead"
+fi
+
 echo
-echo "→ dashboard: http://127.0.0.1:${PORT}/"
+echo "→ dashboard: http://127.0.0.1:${WEB_PORT}/"
 echo
-"$PYTHON" -m camwatch.server --config "$CONFIG" --port "$PORT"
+"$PYTHON" -m camwatch.server --config "$CONFIG" --port "$WEB_PORT"

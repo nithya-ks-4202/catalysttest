@@ -32,6 +32,45 @@ from camwatch.ber import Counter32, Gauge32, TimeTicks  # noqa: E402
 GIB = 1024 ** 3
 
 
+class PortInUseError(Exception):
+    """A simulated camera's UDP port is already taken."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        super().__init__(f"udp/{port} on {host} is already in use")
+
+
+def port_is_free(host: str, port: int) -> bool:
+    """True if a UDP socket can bind host:port right now."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def find_free_base_port(host: str, start: int, count: int,
+                        attempts: int = 400) -> int:
+    """First base port with `count` free consecutive UDP ports above `start`.
+
+    Lets the demo survive a stale simulator (or anything else) holding the
+    default range, instead of dying on a bind error.
+    """
+    port = start
+    for _ in range(attempts):
+        if port + count > 65536:
+            break
+        if all(port_is_free(host, port + i) for i in range(count)):
+            return port
+        port += count
+    raise SystemExit(
+        f"could not find {count} free consecutive UDP ports at or above {start}")
+
+
 @dataclass
 class Personality:
     """How a simulated camera behaves."""
@@ -280,9 +319,17 @@ class Fleet:
             if not camera.personality.reachable:
                 continue  # an unreachable camera simply has nothing listening
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, camera.port))
+            # Deliberately no SO_REUSEADDR: UDP has no TIME_WAIT to work
+            # around, and setting it lets a second simulator bind a port that
+            # is already in use on some platforms - so one instance silently
+            # steals another's traffic instead of failing honestly.
             sock.setblocking(False)
+            try:
+                sock.bind((self.host, camera.port))
+            except OSError as exc:
+                sock.close()
+                self.close()
+                raise PortInUseError(self.host, camera.port) from exc
             camera.sock = sock
             self.selector.register(sock, selectors.EVENT_READ, camera)
 
@@ -387,22 +434,50 @@ def main() -> int:
                         help="write a matching cameras.json and exit-ready config")
     parser.add_argument("--write-config-only", action="store_true",
                         help="write the config and exit without binding any ports")
+    parser.add_argument("--auto-port", action="store_true",
+                        help="if the requested port range is busy, move up to the "
+                             "first free one instead of failing")
+    parser.add_argument("--print-base-port", action="store_true",
+                        help="print only the chosen base port (for scripts)")
     parser.add_argument("--seed", type=int, default=1,
                         help="RNG seed for generated personalities, so a config "
                              "written in one run matches the fleet served by another")
     args = parser.parse_args()
 
-    cameras = build_fleet(args.count, args.base_port, args.community, args.seed)
+    base_port = args.base_port
+    if args.auto_port:
+        base_port = find_free_base_port(args.host, base_port, args.count)
+
+    cameras = build_fleet(args.count, base_port, args.community, args.seed)
     if args.write_config:
         write_config(cameras, args.write_config, args.host, args.community)
-        print(f"wrote {args.write_config}")
+        if not args.print_base_port:
+            print(f"wrote {args.write_config}")
+    if args.print_base_port:
+        # Machine-readable, so a wrapper script can serve on the same ports
+        # the config it just wrote points at.
+        print(base_port)
     if args.write_config_only:
         if not args.write_config:
             parser.error("--write-config-only requires --write-config PATH")
         return 0
 
     fleet = Fleet(cameras, args.host, args.drop_rate)
-    fleet.start()
+    try:
+        fleet.start()
+    except PortInUseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Most likely an earlier simulator is still running. Find it with:",
+              file=sys.stderr)
+        print(f"    lsof -nP -iUDP:{exc.port}            # macOS / Linux",
+              file=sys.stderr)
+        print("and stop it with:", file=sys.stderr)
+        print("    pkill -f tools/fake_camera.py", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Or pick a different range: --base-port {exc.port + 100}, "
+              "or pass --auto-port to choose one automatically.", file=sys.stderr)
+        return 2
     listening = [c for c in cameras if c.sock is not None]
     print(f"Simulating {len(cameras)} cameras "
           f"({len(listening)} listening, {len(cameras) - len(listening)} offline)")

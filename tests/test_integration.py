@@ -5,6 +5,7 @@ because every byte goes over a loopback socket and back.
 """
 
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -864,6 +865,76 @@ class TestCameraManagementDisabled(unittest.TestCase):
         """Refresh only re-polls existing cameras, so it isn't gated."""
         status, _ = self.request("POST", "/api/refresh", None)
         self.assertEqual(status, 200)
+
+
+class TestSimulatorPortHandling(unittest.TestCase):
+    """A busy port must fail loudly, and --auto-port must route around it."""
+
+    port = BASE_PORT + 180
+
+    def test_bind_conflict_raises_a_clear_error(self):
+        from tools.fake_camera import Fleet, PortInUseError, build_fleet
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        blocker.bind(("127.0.0.1", self.port))
+        try:
+            fleet = Fleet(build_fleet(2, self.port))
+            with self.assertRaises(PortInUseError) as ctx:
+                fleet.start()
+            self.assertEqual(ctx.exception.port, self.port)
+        finally:
+            blocker.close()
+
+    def test_failed_start_leaves_no_sockets_open(self):
+        """A half-started fleet must release what it already bound, or the
+        retry on the next port hits its own leftovers."""
+        from tools.fake_camera import Fleet, PortInUseError, build_fleet
+
+        # Block the *second* port so the first binds before the failure.
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        blocker.bind(("127.0.0.1", self.port + 21))
+        try:
+            fleet = Fleet(build_fleet(3, self.port + 20))
+            with self.assertRaises(PortInUseError):
+                fleet.start()
+            # The first port must have been released on the way out.
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.bind(("127.0.0.1", self.port + 20))
+            finally:
+                probe.close()
+        finally:
+            blocker.close()
+
+    def test_find_free_base_port_skips_a_busy_range(self):
+        from tools.fake_camera import find_free_base_port
+
+        start = self.port + 40
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        blocker.bind(("127.0.0.1", start))
+        try:
+            chosen = find_free_base_port("127.0.0.1", start, 4)
+            self.assertGreater(chosen, start)
+            self.assertEqual((chosen - start) % 4, 0)
+        finally:
+            blocker.close()
+
+    def test_find_free_base_port_keeps_the_start_when_free(self):
+        from tools.fake_camera import find_free_base_port
+        start = self.port + 60
+        self.assertEqual(find_free_base_port("127.0.0.1", start, 3), start)
+
+    def test_port_is_free_detects_a_taken_port(self):
+        from tools.fake_camera import port_is_free
+        start = self.port + 80
+        self.assertTrue(port_is_free("127.0.0.1", start))
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        blocker.bind(("127.0.0.1", start))
+        try:
+            # Must be detectable as busy, not masked by SO_REUSEADDR.
+            self.assertFalse(port_is_free("127.0.0.1", start))
+        finally:
+            blocker.close()
 
 
 class TestLoopbackDetection(unittest.TestCase):
