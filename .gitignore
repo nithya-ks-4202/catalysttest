@@ -1,0 +1,14 @@
+# Runtime state
+*.db
+*.db-wal
+*.db-shm
+
+# Local config - it holds community strings; cameras.example.json is the template
+cameras.json
+demo-cameras.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

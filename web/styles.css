@@ -1,0 +1,411 @@
+/* Camera + SD card dashboard.
+ *
+ * Colour roles come from the reference data-viz palette: status colours are
+ * reserved for state (good / warning / serious / critical) and always ship
+ * with an icon and a label, never colour alone. Series colours (the one blue)
+ * are for chart marks only - text always wears a text token.
+ */
+
+.viz-root {
+  color-scheme: light;
+
+  /* Surfaces & ink */
+  --surface-1:      #fcfcfb;
+  --page:           #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --gridline:       #e1e0d9;
+  --baseline:       #c3c2b7;
+  --border:         rgba(11, 11, 11, 0.10);
+  --hover-wash:     rgba(11, 11, 11, 0.04);
+
+  /* Single series hue (sparklines, trend line) */
+  --series-1:       #2a78d6;
+  --series-1-wash:  rgba(42, 120, 214, 0.10);
+  --track-1:        #cde2fb;
+
+  /* Status palette - fixed, never themed */
+  --status-good:     #0ca30c;
+  --status-warning:  #fab219;
+  --status-serious:  #ec835a;
+  --status-critical: #d03b3b;
+  --status-unknown:  #898781;
+
+  /* Meter tracks: a lighter step of each fill's own ramp, so state reads
+     across the whole bar rather than only the filled part. */
+  --track-good:     #cdeccd;
+  --track-warning:  #feeecb;
+  --track-serious:  #fbe2d8;
+  --track-critical: #f4d3d3;
+  --track-unknown:  #e4e3de;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgba(11, 11, 11, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255, 255, 255, 0.10);
+    --hover-wash:     rgba(255, 255, 255, 0.06);
+    --series-1:       #3987e5;
+    --series-1-wash:  rgba(57, 135, 229, 0.14);
+    --track-1:        #184f95;
+    --track-good:     #0d3d0d;
+    --track-warning:  #4a3407;
+    --track-serious:  #4a2a1c;
+    --track-critical: #451414;
+    --track-unknown:  #33322f;
+    --shadow: none;
+  }
+}
+
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1:      #1a1a19;
+  --page:           #0d0d0d;
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #898781;
+  --gridline:       #2c2c2a;
+  --baseline:       #383835;
+  --border:         rgba(255, 255, 255, 0.10);
+  --hover-wash:     rgba(255, 255, 255, 0.06);
+  --series-1:       #3987e5;
+  --series-1-wash:  rgba(57, 135, 229, 0.14);
+  --track-1:        #184f95;
+  --track-good:     #0d3d0d;
+  --track-warning:  #4a3407;
+  --track-serious:  #4a2a1c;
+  --track-critical: #451414;
+  --track-unknown:  #33322f;
+  --shadow: none;
+}
+
+* { box-sizing: border-box; }
+
+/* An author `display` rule outranks the UA stylesheet's `[hidden]`, so the
+   grid/table containers would stay visible when toggled. Re-assert it. */
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  padding: 0 0 48px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2 { margin: 0; font-weight: 600; }
+h1 { font-size: 17px; letter-spacing: -0.01em; }
+h2 { font-size: 14px; }
+p { margin: 0; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px;
+  padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* --- top bar ---------------------------------------------------------- */
+
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+  position: sticky; top: 0; z-index: 20;
+}
+.topbar-sub { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+.topbar-actions { display: flex; gap: 8px; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: 32px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-1); color: var(--text-primary);
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.btn:hover { background: var(--hover-wash); }
+.btn:active { transform: translateY(0.5px); }
+.btn-icon-only { padding: 0; width: 32px; justify-content: center; }
+.btn-icon { font-size: 14px; line-height: 1; }
+.btn.is-busy .btn-icon { animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+main { max-width: 1400px; margin: 0 auto; padding: 0 24px; }
+
+/* --- filter row (one row, above everything it scopes) ------------------ */
+
+.filters {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 16px 0;
+}
+.filter-search { flex: 1 1 220px; min-width: 200px; }
+.filter-search input, .filter-range select {
+  width: 100%; min-height: 32px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-1); color: var(--text-primary); font: inherit; font-size: 13px;
+}
+.filter-range select { width: auto; }
+.filter-chips, .filter-view { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.chip {
+  min-height: 32px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface-1); color: var(--text-secondary);
+  font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.chip:hover { background: var(--hover-wash); }
+.chip.is-selected {
+  background: var(--text-primary); color: var(--surface-1);
+  border-color: var(--text-primary);
+}
+
+/* --- cards ------------------------------------------------------------ */
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+}
+.card-head { margin-bottom: 14px; }
+.card-sub { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+
+.overview {
+  display: grid; grid-template-columns: minmax(240px, 1fr) 3fr;
+  gap: 12px; margin-bottom: 12px;
+}
+.tile-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+
+.tile-label {
+  color: var(--text-secondary); font-size: 12px; font-weight: 500;
+}
+/* Proportional figures on big standalone numbers - tabular-nums only in
+   columns that have to line up (the table and axis ticks). */
+.hero-figure {
+  font-size: 56px; font-weight: 600; line-height: 1.05;
+  letter-spacing: -0.02em; margin: 6px 0 4px;
+}
+.hero-detail { color: var(--text-secondary); font-size: 12px; }
+.hero-card { display: flex; flex-direction: column; justify-content: center; }
+.tile-value { font-size: 26px; font-weight: 600; line-height: 1.2; margin: 4px 0 2px; }
+.tile-meta { color: var(--text-muted); font-size: 12px; }
+
+/* --- fleet status bar ------------------------------------------------- */
+
+.charts {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px;
+}
+.chart-card { display: flex; flex-direction: column; }
+
+/* The status card is shorter than the trend chart beside it; centring the
+   bar + legend block keeps the leftover height from reading as a void. */
+.status-card-body {
+  flex: 1; display: flex; flex-direction: column; justify-content: center;
+}
+
+/* Segments are separated by a 2px gap in the surface colour, never a border. */
+.status-bar {
+  display: flex; gap: 2px; height: 36px; margin-bottom: 16px;
+  background: var(--surface-1);
+}
+.status-seg {
+  border-radius: 2px; min-width: 3px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600;
+  cursor: default; transition: opacity 0.12s ease;
+}
+.status-seg:hover { opacity: 0.85; }
+.status-seg-label { padding: 0 6px; white-space: nowrap; }
+
+.status-legend {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 6px 18px;
+}
+.status-legend li {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--text-secondary);
+}
+.legend-swatch {
+  width: 10px; height: 10px; border-radius: 3px; flex: none;
+}
+.legend-count { color: var(--text-primary); font-weight: 600; }
+
+/* --- trend chart ------------------------------------------------------ */
+
+.chart-holder { position: relative; flex: 1; min-height: 168px; }
+.chart-holder svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.grid-line { stroke: var(--gridline); stroke-width: 1; }
+.axis-line { stroke: var(--baseline); stroke-width: 1; }
+.axis-text {
+  fill: var(--text-muted); font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.trend-line { fill: none; stroke: var(--series-1); stroke-width: 2;
+              stroke-linejoin: round; stroke-linecap: round; }
+.trend-area { fill: var(--series-1-wash); }
+.trend-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+.crosshair { stroke: var(--baseline); stroke-width: 1; }
+.chart-empty {
+  position: absolute; inset: 0; display: flex;
+  align-items: center; justify-content: center;
+  color: var(--text-muted); font-size: 12px; text-align: center; padding: 0 20px;
+}
+
+/* --- camera cards ----------------------------------------------------- */
+
+.section-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px;
+}
+.camera-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+.camera-card { display: flex; flex-direction: column; gap: 12px; }
+.camera-card.is-stale { opacity: 0.55; }
+
+.camera-head { display: flex; align-items: flex-start; gap: 10px; }
+.camera-title { flex: 1; min-width: 0; }
+.camera-name {
+  font-weight: 600; font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.camera-host {
+  color: var(--text-muted); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Status always reads as icon + label + colour, never colour alone. */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+  padding: 2px 8px 2px 6px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.01em;
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+}
+.status-icon { font-size: 11px; line-height: 1; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+.meter-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+.meter-label {
+  color: var(--text-secondary); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.meter-value { font-weight: 600; font-size: 13px; flex: none; }
+.meter {
+  height: 8px; border-radius: 4px; overflow: hidden;
+  background: var(--track-unknown);
+}
+.meter-fill { height: 100%; border-radius: 4px; transition: width 0.3s ease; }
+.meter-foot {
+  display: flex; justify-content: space-between; gap: 8px;
+  color: var(--text-muted); font-size: 11px; margin-top: 5px;
+}
+
+.spark-row { display: flex; align-items: center; gap: 10px; }
+/* Positioned, so the absolute .chart-empty fallback stays inside the card
+   instead of escaping to the page. */
+.spark-holder { position: relative; flex: 1; height: 34px; min-width: 0; }
+.spark-caption { color: var(--text-muted); font-size: 11px; flex: none; }
+.spark-line { fill: none; stroke: var(--series-1); stroke-width: 2;
+              stroke-linejoin: round; stroke-linecap: round; }
+.spark-area { fill: var(--series-1-wash); }
+.spark-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+
+.issue-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.issue-list li {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 12px; color: var(--text-secondary);
+}
+.issue-list .status-icon { margin-top: 2px; }
+.camera-foot {
+  display: flex; flex-wrap: wrap; gap: 4px 12px;
+  color: var(--text-muted); font-size: 11px;
+  border-top: 1px solid var(--border); padding-top: 10px; margin-top: auto;
+}
+
+/* --- table view (the WCAG-clean twin of the cards) -------------------- */
+
+.table-wrap {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow-x: auto;
+}
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th, .data-table td {
+  padding: 9px 14px; text-align: left; border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.data-table th {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.03em;
+  text-transform: uppercase; color: var(--text-secondary);
+  position: sticky; top: 0; background: var(--surface-1);
+}
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table tbody tr:hover { background: var(--hover-wash); }
+.data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.data-table .issues-cell {
+  white-space: normal; color: var(--text-secondary); min-width: 220px;
+}
+
+.empty-state {
+  padding: 40px; text-align: center; color: var(--text-muted);
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* --- tooltip ---------------------------------------------------------- */
+
+.tooltip {
+  position: fixed; z-index: 50; pointer-events: none;
+  background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  box-shadow: 0 4px 14px rgba(11, 11, 11, 0.16);
+  padding: 8px 10px; font-size: 12px; max-width: 260px;
+}
+.tooltip-title { font-weight: 600; margin-bottom: 3px; }
+.tooltip-row { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+/* Hold the previous render at reduced opacity while refetching - never a
+   skeleton flash, never a layout jump. */
+.is-refreshing .camera-grid,
+.is-refreshing .table-wrap,
+.is-refreshing .overview { opacity: 0.6; transition: opacity 0.15s ease; }
+
+@media (max-width: 1080px) {
+  .overview { grid-template-columns: 1fr; }
+  .charts { grid-template-columns: 1fr; }
+  .tile-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 560px) {
+  main, .topbar { padding-left: 14px; padding-right: 14px; }
+  .tile-grid { grid-template-columns: 1fr; }
+  .hero-figure { font-size: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* Forced-colors: fall back to system colours and let the icon + label carry
+   status, since custom fills are dropped entirely in this mode. */
+@media (forced-colors: active) {
+  .card, .table-wrap, .chip, .btn { border: 1px solid CanvasText; }
+  .meter-fill, .status-seg { forced-color-adjust: none; }
+}

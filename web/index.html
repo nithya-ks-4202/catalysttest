@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera &amp; SD card monitor</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📹</text></svg>">
+</head>
+<body class="viz-root">
+
+<header class="topbar">
+  <div class="topbar-title">
+    <h1>Camera &amp; SD card monitor</h1>
+    <p class="topbar-sub" id="poll-status">Connecting…</p>
+  </div>
+  <div class="topbar-actions">
+    <button type="button" id="refresh" class="btn">
+      <span class="btn-icon" aria-hidden="true">↻</span> Refresh
+    </button>
+    <button type="button" id="theme-toggle" class="btn btn-icon-only"
+            aria-label="Switch colour theme" title="Switch colour theme">
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <!-- One filter row above everything it scopes. -->
+  <section class="filters" aria-label="Filters">
+    <div class="filter-search">
+      <label class="visually-hidden" for="search">Search cameras</label>
+      <input type="search" id="search" placeholder="Search camera, site or card…"
+             autocomplete="off">
+    </div>
+    <div class="filter-chips" role="group" aria-label="Filter by status">
+      <button type="button" class="chip is-selected" data-status="all" aria-pressed="true">All</button>
+      <button type="button" class="chip" data-status="attention" aria-pressed="false">Needs attention</button>
+      <button type="button" class="chip" data-status="critical" aria-pressed="false">Critical</button>
+      <button type="button" class="chip" data-status="offline" aria-pressed="false">Offline</button>
+      <button type="button" class="chip" data-status="good" aria-pressed="false">Healthy</button>
+    </div>
+    <div class="filter-range">
+      <label class="visually-hidden" for="range">Time range</label>
+      <select id="range">
+        <option value="6">Last 6 hours</option>
+        <option value="24" selected>Last 24 hours</option>
+        <option value="168">Last 7 days</option>
+        <option value="720">Last 30 days</option>
+      </select>
+    </div>
+    <div class="filter-view" role="group" aria-label="View">
+      <button type="button" class="chip is-selected" data-view="cards" aria-pressed="true">Cards</button>
+      <button type="button" class="chip" data-view="table" aria-pressed="false">Table</button>
+    </div>
+  </section>
+
+  <!-- Hero figure + supporting stat tiles. Exactly one hero per view. -->
+  <section class="overview" aria-label="Fleet overview">
+    <div class="card hero-card">
+      <p class="tile-label">Cameras needing attention</p>
+      <p class="hero-figure" id="hero-value">–</p>
+      <p class="hero-detail" id="hero-detail">Waiting for the first poll…</p>
+    </div>
+
+    <div class="tile-grid">
+      <div class="card tile">
+        <p class="tile-label">Cameras online</p>
+        <p class="tile-value" id="tile-online">–</p>
+        <p class="tile-meta" id="tile-online-meta">&nbsp;</p>
+      </div>
+      <div class="card tile">
+        <p class="tile-label">SD cards detected</p>
+        <p class="tile-value" id="tile-cards">–</p>
+        <p class="tile-meta" id="tile-cards-meta">&nbsp;</p>
+      </div>
+      <div class="card tile">
+        <p class="tile-label">Fleet storage used</p>
+        <p class="tile-value" id="tile-capacity">–</p>
+        <p class="tile-meta" id="tile-capacity-meta">&nbsp;</p>
+      </div>
+      <div class="card tile">
+        <p class="tile-label">Soonest card full</p>
+        <p class="tile-value" id="tile-full">–</p>
+        <p class="tile-meta" id="tile-full-meta">&nbsp;</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="charts" aria-label="Fleet charts">
+    <div class="card chart-card">
+      <div class="card-head">
+        <h2>Fleet status</h2>
+        <p class="card-sub">Every camera, by current severity</p>
+      </div>
+      <div class="status-card-body">
+        <div class="status-bar" id="status-bar"></div>
+        <ul class="status-legend" id="status-legend"></ul>
+      </div>
+    </div>
+
+    <div class="card chart-card">
+      <div class="card-head">
+        <h2>Average SD card usage</h2>
+        <p class="card-sub" id="trend-sub">Mean across all cameras with a card</p>
+      </div>
+      <div class="chart-holder" id="trend-chart"></div>
+    </div>
+  </section>
+
+  <section class="fleet" aria-label="Cameras">
+    <div class="section-head">
+      <h2 id="fleet-heading">Cameras</h2>
+      <p class="card-sub" id="fleet-count"></p>
+    </div>
+    <div class="camera-grid" id="camera-grid"></div>
+    <div class="table-wrap" id="table-view" hidden>
+      <table class="data-table">
+        <caption class="visually-hidden">
+          Every camera with its SD card status, capacity and issues
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Camera</th>
+            <th scope="col">Status</th>
+            <th scope="col">SD card</th>
+            <th scope="col" class="num">Used</th>
+            <th scope="col" class="num">Free</th>
+            <th scope="col" class="num">Capacity</th>
+            <th scope="col" class="num">Days to full</th>
+            <th scope="col">Issues</th>
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+    <p class="empty-state" id="empty-state" hidden>No cameras match this filter.</p>
+  </section>
+</main>
+
+<div class="tooltip" id="tooltip" role="status" aria-live="polite" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
